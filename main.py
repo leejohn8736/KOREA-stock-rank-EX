@@ -3,8 +3,13 @@ import re
 from bs4 import BeautifulSoup
 import requests
 
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
-CHAT_ID = os.environ.get("CHAT_ID", "").strip()
+# TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID 우선 사용 (없으면 기존 이름도 보조 확인)
+TELEGRAM_TOKEN = (
+    os.environ.get("TELEGRAM_BOT_TOKEN") or os.environ.get("TELEGRAM_TOKEN") or ""
+).strip()
+CHAT_ID = (
+    os.environ.get("TELEGRAM_CHAT_ID") or os.environ.get("CHAT_ID") or ""
+).strip()
 
 HEADERS = {
     "User-Agent": (
@@ -56,15 +61,9 @@ def fetch_from_naver_finance_popular():
     seen_codes.add(code)
 
     cells = [td.get_text(" ", strip=True) for td in tr.select("td")]
-    # 보통 [순위, 종목명, 검색비율, 현재가, 전일비, 등락률, ...] 형태
     price = ""
     rate = ""
-    for c in cells:
-      if not price and re.fullmatch(r"[0-9,]+", c) and len(c.replace(",", "")) >= 2:
-        # 순위(1~50)나 검색비율(소수점/퍼센트)과 구분하기 위해 두 번째 이후 정수 후보 우선
-        pass
 
-    # 셀 텍스트에서 등락률(%)과 가격(쉼표 포함 숫자) 추출
     rate_match = [c for c in cells if "%" in c or re.fullmatch(r"[+-]?\d+\.\d+%?", c)]
     num_match = [c for c in cells if re.fullmatch(r"[0-9,]{2,}", c)]
 
@@ -98,7 +97,9 @@ def fetch_from_naver_finance_popular():
 
 def send_telegram(text):
   if not TELEGRAM_TOKEN or not CHAT_ID:
-    raise ValueError("TELEGRAM_TOKEN 또는 CHAT_ID 환경변수가 비어 있습니다.")
+    raise ValueError(
+        "TELEGRAM_BOT_TOKEN 또는 TELEGRAM_CHAT_ID 환경변수가 비어 있습니다."
+    )
 
   url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
   payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}
