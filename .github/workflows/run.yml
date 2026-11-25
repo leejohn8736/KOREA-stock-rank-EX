@@ -27,7 +27,7 @@ jobs:
       - name: 패키지 설치
         run: |
           python -m pip install --upgrade pip
-          pip install requests beautifulsoup4
+          pip install requests beautifulsoup4 pykrx
 
       - name: 한국장 랭킹 순위 발송 실행
         env:
