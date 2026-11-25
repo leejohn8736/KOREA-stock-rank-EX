@@ -16,130 +16,84 @@ HEADERS = {
 }
 
 
-def pick_first(d: dict, keys: list[str], default=""):
-  for k in keys:
-    if k in d and d[k] is not None and str(d[k]).strip() != "":
-      return d[k]
-  return default
-
-
-def extract_items(data):
-  if isinstance(data, list):
-    return data
-  if isinstance(data, dict):
-    for key in (
-        "stocks",
-        "items",
-        "list",
-        "result",
-        "data",
-        "stockList",
-        "topStocks",
-    ):
-      val = data.get(key)
-      if isinstance(val, list) and len(val) > 0:
-        return val
-      if isinstance(val, dict):
-        for inner_key in (
-            "stocks",
-            "items",
-            "list",
-            "stockList",
-            "topStocks",
-        ):
-          if isinstance(val.get(inner_key), list) and len(val[inner_key]) > 0:
-            return val[inner_key]
-  return []
-
-
-def fetch_from_naver_json_candidates():
-  candidates = [
-      "https://m.stock.naver.com/api/stocks/top",
-      "https://m.stock.naver.com/api/stock/top",
-      "https://stock.naver.com/api/stock/top",
-  ]
-  for url in candidates:
+def decode_html(res: requests.Response) -> str:
+  raw = res.content
+  for enc in ("euc-kr", "cp949", "utf-8"):
     try:
-      res = requests.get(
-          url, headers=HEADERS, params={"page": 1, "pageSize": 20}, timeout=12
-      )
-      if res.status_code != 200:
-        continue
-      data = res.json()
-      stocks = extract_items(data)
-      if not stocks:
-        continue
-
-      lines = ["📊 *한국장 랭킹 순위*\n"]
-      for idx, item in enumerate(stocks[:15], 1):
-        name = pick_first(
-            item, ["stockName", "name", "itemName", "reutersName"]
-        )
-        code = pick_first(
-            item, ["itemCode", "code", "stockCode", "symbolCode"]
-        )
-        price = pick_first(
-            item, ["closePrice", "nowVal", "currentPrice", "price"]
-        )
-        rate = pick_first(
-            item, ["fluctuationsRatio", "changeRate", "rat", "prdyCtrt"]
-        )
-        if name:
-          lines.append(f"{idx}. *{name}* ({code}) : {price}원 ({rate}%)")
-      if len(lines) > 1:
-        return "\n".join(lines)
-    except Exception:
+      text = raw.decode(enc)
+      if "인기검색" in text or "종목명" in text or "item/main.naver" in text:
+        return text
+    except UnicodeDecodeError:
       continue
-  return None
+  return raw.decode("utf-8", errors="replace")
 
 
 def fetch_from_naver_finance_popular():
   url = "https://finance.naver.com/sise/lastsearch2.naver"
   res = requests.get(url, headers=HEADERS, timeout=15)
-  res.encoding = "euc-kr"
   res.raise_for_status()
 
-  soup = BeautifulSoup(res.text, "html.parser")
-  rows = soup.select("table.type_5 tr")
+  html = decode_html(res)
+  soup = BeautifulSoup(html, "html.parser")
 
   items = []
-  for tr in rows:
-    cols = [td.get_text(" ", strip=True) for td in tr.select("td")]
-    if len(cols) < 5:
-      continue
-    link = tr.select_one("a.tltle")
+  seen_codes = set()
+
+  for tr in soup.select("table tr"):
+    link = tr.select_one('a[href*="code="]')
     if not link:
       continue
 
-    name = link.get_text(strip=True)
+    name = link.get_text(" ", strip=True)
     href = link.get("href", "")
-    m = re.search(r"code=(\d+)", href)
-    code = m.group(1) if m else ""
+    m = re.search(r"code=([0-9A-Za-z]{6})", href)
+    if not m or not name:
+      continue
 
-    price = cols[2] if len(cols) > 2 else ""
-    rate = cols[4] if len(cols) > 4 else ""
+    code = m.group(1)
+    if code in seen_codes:
+      continue
+    seen_codes.add(code)
+
+    cells = [td.get_text(" ", strip=True) for td in tr.select("td")]
+    # 보통 [순위, 종목명, 검색비율, 현재가, 전일비, 등락률, ...] 형태
+    price = ""
+    rate = ""
+    for c in cells:
+      if not price and re.fullmatch(r"[0-9,]+", c) and len(c.replace(",", "")) >= 2:
+        # 순위(1~50)나 검색비율(소수점/퍼센트)과 구분하기 위해 두 번째 이후 정수 후보 우선
+        pass
+
+    # 셀 텍스트에서 등락률(%)과 가격(쉼표 포함 숫자) 추출
+    rate_match = [c for c in cells if "%" in c or re.fullmatch(r"[+-]?\d+\.\d+%?", c)]
+    num_match = [c for c in cells if re.fullmatch(r"[0-9,]{2,}", c)]
+
+    if rate_match:
+      rate = rate_match[0]
+    if len(num_match) >= 2:
+      price = num_match[1]
+    elif len(num_match) == 1:
+      price = num_match[0]
+
     items.append((name, code, price, rate))
     if len(items) >= 15:
       break
 
   if not items:
+    title = soup.title.get_text(strip=True) if soup.title else "제목없음"
+    sample = re.sub(r"\s+", " ", soup.get_text(" ", strip=True))[:250]
     raise RuntimeError(
-        "인기검색종목 데이터를 파싱하지 못했습니다. (응답 길이:"
-        f" {len(res.text)})"
+        f"인기검색종목 파싱 실패 (응답 길이: {len(html)}, title: {title}, "
+        f"본문 일부: {sample})"
     )
 
   lines = ["📊 *한국장 인기검색 랭킹 TOP 15*\n"]
   for idx, (name, code, price, rate) in enumerate(items, 1):
-    lines.append(f"{idx}. *{name}* ({code}) : {price}원 ({rate})")
+    price_str = f"{price}원" if price and not str(price).endswith("원") else str(price)
+    rate_str = f" ({rate})" if rate else ""
+    lines.append(f"{idx}. *{name}* ({code}) : {price_str}{rate_str}")
 
   return "\n".join(lines)
-
-
-def get_top_stocks_message():
-  msg = fetch_from_naver_json_candidates()
-  if msg:
-    return msg
-  return fetch_from_naver_finance_popular()
 
 
 def send_telegram(text):
@@ -153,6 +107,6 @@ def send_telegram(text):
 
 
 if __name__ == "__main__":
-  msg = get_top_stocks_message()
+  msg = fetch_from_naver_finance_popular()
   send_telegram(msg)
   print("전송 완료")
