@@ -1,6 +1,8 @@
+from datetime import datetime, timedelta
 import os
 import re
 from bs4 import BeautifulSoup
+from pykrx import stock
 import requests
 
 TELEGRAM_TOKEN = (
@@ -10,15 +12,17 @@ CHAT_ID = (
     os.environ.get("TELEGRAM_CHAT_ID") or os.environ.get("CHAT_ID") or ""
 ).strip()
 
+# 원하시면 브라우저 개발자 도구(F12 -> Network -> Fetch/XHR)에서 확인한
+# 실제 Npay 증권 랭킹 JSON API 주소를 여기에 넣으면 최우선으로 시도합니다.
+CUSTOM_RANK_API_URL = os.environ.get("CUSTOM_RANK_API_URL", "").strip()
+
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
         " (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
     ),
     "Referer": "https://stock.naver.com/market/stock/kr/stocklist/top",
-    "Accept": (
-        "text/html,application/xhtml+xml,application/xml;q=0.9,application/json,*/*;q=0.8"
-    ),
+    "Accept": "application/json, text/plain, */*",
     "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
 }
 
@@ -41,6 +45,7 @@ ETF_ETN_BRANDS = (
     "네비게이터",
     "히어로즈",
     "KIWOOM",
+    "TDF",
 )
 
 
@@ -60,23 +65,11 @@ def is_etf_or_etn(name: str, item_type: str = "") -> bool:
     p_upper = prefix.upper()
     if n_upper.startswith(p_upper + " ") or n_upper.startswith(p_upper):
       if re.search(
-          r"(ETN|ETF|레버리지|인버스|곱버스|선물|채권|액티브|커버드콜|2X|3X|USD|달러|금현물|원유|S&P|나스닥|코스피|코스닥)",
+          r"(ETN|ETF|레버리지|인버스|곱버스|선물|채권|액티브|커버드콜|2X|3X|USD|달러|금현물|원유|S&P|나스닥|코스피|코스닥|채권혼합|국고채)",
           n_upper,
       ):
         return True
   return False
-
-
-def decode_response(res: requests.Response) -> str:
-  raw = res.content
-  for enc in ("utf-8", "euc-kr", "cp949"):
-    try:
-      text = raw.decode(enc)
-      if "종목명" in text or "인기검색" in text or "stockName" in text or "code=" in text:
-        return text
-    except UnicodeDecodeError:
-      continue
-  return raw.decode("utf-8", errors="replace")
 
 
 def pick_first(d: dict, keys: list[str], default: str = "") -> str:
@@ -86,123 +79,127 @@ def pick_first(d: dict, keys: list[str], default: str = "") -> str:
   return default
 
 
-def walk_items(obj, out: list):
+def walk_stock_dicts(obj, out: list):
   if isinstance(obj, list):
-    for x in obj:
-      walk_items(x, out)
+    for item in obj:
+      walk_stock_dicts(item, out)
   elif isinstance(obj, dict):
-    name = pick_first(obj, ["stockName", "itemName", "name", "reutersName", "stkNm"])
-    code = pick_first(obj, ["itemCode", "stockCode", "code", "symbolCode", "isuCd"])
+    name = pick_first(
+        obj, ["stockName", "itemName", "name", "reutersName", "stkNm"]
+    )
+    code = pick_first(
+        obj, ["itemCode", "stockCode", "code", "symbolCode", "isuCd"]
+    )
     if name and re.fullmatch(r"[0-9A-Za-z]{6}", code):
       out.append(obj)
     for v in obj.values():
       if isinstance(v, (dict, list)):
-        walk_items(v, out)
+        walk_stock_dicts(v, out)
 
 
-def try_json_apis(diagnostics: list[str]) -> list[tuple[str, str, str, str]]:
-  api_candidates = [
-      ("https://m.stock.naver.com/api/stocks/top", {"page": 1, "pageSize": 50}),
-      ("https://m.stock.naver.com/api/stock/top", {"page": 1, "pageSize": 50}),
-      ("https://stock.naver.com/api/stock/top", {"page": 1, "pageSize": 50}),
-  ]
-  for url, params in api_candidates:
-    try:
-      res = requests.get(url, headers=HEADERS, params=params, timeout=12)
-      diagnostics.append(f"API {url} -> HTTP {res.status_code}")
-      if res.status_code != 200:
-        continue
-      data = res.json()
-      raw_items = []
-      walk_items(data, raw_items)
-      if not raw_items:
-        continue
+def try_custom_api() -> tuple[str, list[tuple[str, str, str]]] | None:
+  if not CUSTOM_RANK_API_URL:
+    return None
+  try:
+    res = requests.get(CUSTOM_RANK_API_URL, headers=HEADERS, timeout=12)
+    res.raise_for_status()
+    data = res.json()
+    raw_items = []
+    walk_stock_dicts(data, raw_items)
 
-      results = []
-      seen = set()
-      for item in raw_items:
-        name = pick_first(item, ["stockName", "itemName", "name", "reutersName", "stkNm"])
-        code = pick_first(item, ["itemCode", "stockCode", "code", "symbolCode", "isuCd"])
-        itype = pick_first(item, ["itemType", "type", "marketType", "stockType"])
-        price = pick_first(item, ["closePrice", "nowVal", "currentPrice", "price", "nv"])
-        rate = pick_first(item, ["fluctuationsRatio", "changeRate", "rat", "prdyCtrt", "cr"])
-
-        if not code or code in seen or is_etf_or_etn(name, itype):
-          continue
-        seen.add(code)
-        results.append((name, code, price, rate))
-        if len(results) >= 20:
-          return results
-    except Exception as e:
-      diagnostics.append(f"API {url} -> 예외: {e}")
-  return []
-
-
-def try_html_pages(diagnostics: list[str]) -> list[tuple[str, str, str, str]]:
-  page_urls = [
-      "https://finance.naver.com/sise/lastsearch2.naver",
-      "https://stock.naver.com/market/stock/kr/stocklist/top",
-  ]
-  for url in page_urls:
-    try:
-      res = requests.get(url, headers=HEADERS, timeout=15)
-      html = decode_response(res)
-      soup = BeautifulSoup(html, "html.parser")
-      title = soup.title.get_text(strip=True) if soup.title else "제목없음"
-      diagnostics.append(
-          f"HTML {url} -> HTTP {res.status_code}, len={len(html)}, title='{title}'"
+    rows = []
+    seen = set()
+    for item in raw_items:
+      name = pick_first(
+          item, ["stockName", "itemName", "name", "reutersName", "stkNm"]
       )
-      if res.status_code != 200:
+      code = pick_first(
+          item, ["itemCode", "stockCode", "code", "symbolCode", "isuCd"]
+      )
+      itype = pick_first(item, ["itemType", "type", "marketType", "stockType"])
+      price = pick_first(
+          item, ["closePrice", "nowVal", "currentPrice", "price", "nv"]
+      )
+      rate = pick_first(
+          item, ["fluctuationsRatio", "changeRate", "rat", "prdyCtrt", "cr"]
+      )
+
+      if not code or code in seen or is_etf_or_etn(name, itype):
         continue
+      seen.add(code)
+      price_str = (
+          f"{price}원" if price and not price.endswith("원") else (price or "-")
+      )
+      rate_str = f" ({rate}%)" if rate and not rate.endswith("%") else (f" ({rate})" if rate else "")
+      rows.append((name, code, f"{price_str}{rate_str}"))
+      if len(rows) >= 20:
+        break
 
-      results = []
-      seen = set()
-      for tr in soup.select("table tr"):
-        link = tr.select_one('a[href*="code="], a[href*="/stock/"]')
-        if not link:
-          continue
-        name = link.get_text(" ", strip=True)
-        href = link.get("href", "")
-        m = re.search(r"(?:code=|/stock/)([0-9A-Za-z]{6})", href)
-        if not m or not name:
-          continue
-        code = m.group(1)
-        if code in seen or is_etf_or_etn(name):
-          continue
-
-        cells = [td.get_text(" ", strip=True) for td in tr.select("td")]
-        price = cells[3] if len(cells) > 3 else ""
-        rate = cells[5] if len(cells) > 5 else ""
-
-        seen.add(code)
-        results.append((name, code, price, rate))
-        if len(results) >= 20:
-          return results
-
-      if results:
-        return results
-    except Exception as e:
-      diagnostics.append(f"HTML {url} -> 예외: {e}")
-  return []
+    if rows:
+      return "Npay 증권 랭킹 TOP 20 (ETF·ETN 제외)", rows
+  except Exception as e:
+    print(f"[안내] CUSTOM_RANK_API_URL 조회 실패: {e}")
+  return None
 
 
-def get_popular_top20_message() -> str:
-  diagnostics: list[str] = []
-  items = try_json_apis(diagnostics)
-  if not items:
-    items = try_html_pages(diagnostics)
+def get_latest_trading_date() -> str:
+  # KST 기준 최근 영업일(최대 10일 전까지 조회)
+  kst_now = datetime.utcnow() + timedelta(hours=9)
+  for delta in range(0, 10):
+    target = (kst_now - timedelta(days=delta)).strftime("%Y%m%d")
+    df = stock.get_market_ohlcv(target, market="KOSPI")
+    if df is not None and not df.empty and "거래대금" in df.columns:
+      if df["거래대금"].sum() > 0:
+        return target
+  return kst_now.strftime("%Y%m%d")
 
-  if not items:
-    diag_text = "\n - ".join(diagnostics)
-    raise RuntimeError(
-        "인기검색어 순위 데이터를 추출하지 못했습니다.\n - " + diag_text
-    )
 
-  lines = ["📊 한국장 인기검색어 순위 TOP 20 (ETF·ETN 제외)\n"]
-  for rank, (name, code, price, rate) in enumerate(items[:20], 1):
-    price_str = f"{price}원" if price and not price.endswith("원") else (price or "-")
-    rate_str = f" ({rate})" if rate else ""
-    lines.append(f"{rank}. {name} ({code}) : {price_str}{rate_str}")
+def try_krx_top20() -> tuple[str, list[tuple[str, str, str]]]:
+  biz_date = get_latest_trading_date()
+  df = stock.get_market_ohlcv(biz_date, market="ALL")
+  if df is None or df.empty:
+    raise RuntimeError(f"KRX 시세 데이터를 불러오지 못했습니다. (기준일: {biz_date})")
+
+  df_sorted = df.sort_values(by="거래대금", ascending=False)
+
+  rows = []
+  seen = set()
+  for ticker, row in df_sorted.iterrows():
+    code = str(ticker).strip()
+    if code in seen:
+      continue
+    name = stock.get_market_ticker_name(code) or ""
+    if not name or is_etf_or_etn(name):
+      continue
+
+    close_val = int(row.get("종가", 0))
+    rate_val = float(row.get("등락률", 0.0))
+    amount_억 = int(row.get("거래대금", 0) // 100_000_000)
+
+    seen.add(code)
+    info = f"{close_val:,}원 ({rate_val:+.2f}%) | {amount_억:,}억"
+    rows.append((name, code, info))
+
+    if len(rows) >= 20:
+      break
+
+  if not rows:
+    raise RuntimeError("필터링 후 남은 종목이 없습니다.")
+
+  formatted_date = f"{biz_date[:4]}-{biz_date[4:6]}-{biz_date[6:]}"
+  return f"한국장 주목 종목 TOP 20 ({formatted_date} · ETF·ETN 제외)", rows
+
+
+def build_message() -> str:
+  custom = try_custom_api()
+  if custom:
+    title, rows = custom
+  else:
+    title, rows = try_krx_top20()
+
+  lines = [f"📊 {title}\n"]
+  for rank, (name, code, info) in enumerate(rows[:20], 1):
+    lines.append(f"{rank}. {name} ({code}) : {info}")
 
   return "\n".join(lines)
 
@@ -224,6 +221,6 @@ def send_telegram(text: str):
 
 
 if __name__ == "__main__":
-  msg = get_popular_top20_message()
+  msg = build_message()
   send_telegram(msg)
   print("전송 완료")
