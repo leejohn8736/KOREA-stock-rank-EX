@@ -6,9 +6,14 @@ on:
     - cron: "50 22 * * *"
   workflow_dispatch: # Actions 탭에서 수동 테스트 실행 가능
 
+concurrency:
+  group: korea-stock-rank-top20
+  cancel-in-progress: true
+
 jobs:
   send-ranking:
     runs-on: ubuntu-latest
+    timeout-minutes: 2
 
     steps:
       - name: 코드 체크아웃
