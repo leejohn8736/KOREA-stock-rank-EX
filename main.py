@@ -167,7 +167,7 @@ def fetch_market(market: str) -> list[dict]:
     raise RuntimeError(f"{market} 모든 소스 실패 | " + " / ".join(errors))
 
 
-# ---------------------------------------------- 인기검색어: 네이버 검색상위
+# ---------------------------------------------- 인기종목: 네이버 검색상위
 def fetch_popular() -> list[dict]:
     url = "https://finance.naver.com/sise/lastsearch2.naver"
     res = requests.get(url, headers=HEADERS, timeout=15)
@@ -269,19 +269,19 @@ def build_sections() -> list[str]:
         failures.append(f"거래대금: {type(e).__name__}: {e}")
         sections.append(f"{LINE}\n💰 거래대금 순위 수집 실패\n{type(e).__name__}: {e}")
 
-    # 2) 인기검색어
+    # 2) 인기종목
     try:
         pop = fetch_popular()[:TOP_N]
         sections.append(
             section(
-                f"🔎🌟 인기검색어 TOP {TOP_N} 🌟🔎",
+                f"🔎🌟 인기종목 TOP {TOP_N} 🌟🔎",
                 "(네이버 증권 검색상위 · ETF·ETN 제외)",
                 [popular_row(i, r) for i, r in enumerate(pop, 1)],
             )
         )
     except Exception as e:
-        failures.append(f"인기검색어: {type(e).__name__}: {e}")
-        sections.append(f"{LINE}\n🔎 인기검색어 순위 수집 실패\n{type(e).__name__}: {e}")
+        failures.append(f"인기종목: {type(e).__name__}: {e}")
+        sections.append(f"{LINE}\n🔎 인기종목 순위 수집 실패\n{type(e).__name__}: {e}")
 
     if len(failures) == 2:
         raise RuntimeError(" | ".join(failures))
