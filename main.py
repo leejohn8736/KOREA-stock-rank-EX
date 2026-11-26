@@ -168,7 +168,7 @@ def fetch_market(market: str) -> list[dict]:
 
 
 # ---------------------------------------------- 인기종목: 네이버 검색상위
-def fetch_popular() -> list[dict]:
+def fetch_popular_pc() -> list[dict]:
     url = "https://finance.naver.com/sise/lastsearch2.naver"
     res = requests.get(url, headers=HEADERS, timeout=15)
     res.raise_for_status()
@@ -206,6 +206,99 @@ def fetch_popular() -> list[dict]:
     return out
 
 
+# ------------- 인기종목: stock.naver.com 랭킹 API (stocklist/top 페이지가 쓰는 API)
+POPULAR_API_URL = "https://stock.naver.com/api/domestic/market/stock/default"
+POPULAR_ORDER_TYPE = os.environ.get("POPULAR_ORDER_TYPE", "quantTop").strip() or "quantTop"
+STOCK_HEADERS = {
+    **HEADERS,
+    "Referer": "https://stock.naver.com/market/stock/kr/stocklist/top",
+    "Origin": "https://stock.naver.com",
+}
+
+
+def _pick(d: dict, keys: list[str]):
+    low = {k.lower(): v for k, v in d.items()}
+    for k in keys:
+        v = low.get(k.lower())
+        if v is not None and str(v).strip() != "":
+            return v
+    return None
+
+
+def _find_stock_dicts(obj, out: list):
+    if isinstance(obj, list):
+        for x in obj:
+            _find_stock_dicts(x, out)
+    elif isinstance(obj, dict):
+        code = _pick(obj, ["itemcode", "itemCode", "stockCode", "code"])
+        name = _pick(obj, ["itemname", "itemName", "stockName", "name"])
+        if code and name and re.fullmatch(r"[0-9A-Za-z]{6}", str(code).strip()):
+            out.append(obj)
+        for v in obj.values():
+            if isinstance(v, (dict, list)):
+                _find_stock_dicts(v, out)
+
+
+def fetch_popular_api() -> list[dict]:
+    out, seen = [], set()
+    page_size = 50
+    for start in range(0, page_size * 4, page_size):
+        res = requests.get(
+            POPULAR_API_URL,
+            params={
+                "tradeType": "KRX",
+                "marketType": "ALL",
+                "orderType": POPULAR_ORDER_TYPE,
+                "startIdx": start,
+                "pageSize": page_size,
+            },
+            headers=STOCK_HEADERS,
+            timeout=15,
+        )
+        res.raise_for_status()
+        items: list = []
+        _find_stock_dicts(res.json(), items)
+        if not items:
+            break
+        for it in items:
+            code = str(_pick(it, ["itemcode", "itemCode", "stockCode", "code"])).strip()
+            name = str(_pick(it, ["itemname", "itemName", "stockName", "name"])).strip()
+            if code in seen or is_etf_or_etn(name):
+                continue
+            end_type = str(_pick(it, ["stockEndType", "endType"]) or "stock").lower()
+            if end_type in ("etf", "etn"):
+                continue
+            seen.add(code)
+            out.append(
+                {
+                    "name": name,
+                    "code": code,
+                    "price": to_num(_pick(it, ["nowPrice", "closePrice", "currentPrice"])),
+                    "rate": to_num(
+                        _pick(it, ["prevChangeRate", "fluctuationsRatio", "changeRate"])
+                    ),
+                    "ratio": "",
+                }
+            )
+        if len(out) >= TOP_N:
+            break
+        time.sleep(0.3)
+    if not out:
+        raise RuntimeError("랭킹 API 응답에서 종목을 찾지 못했습니다.")
+    return out
+
+
+def fetch_popular() -> list[dict]:
+    errors = []
+    for fn in (fetch_popular_api, fetch_popular_pc):
+        try:
+            return fn()
+        except Exception as e:
+            errors.append(f"{fn.__name__}: {type(e).__name__}: {e}")
+            print(f"[안내] 인기종목 {errors[-1]}")
+    raise RuntimeError("인기종목 모든 소스 실패 | " + " / ".join(errors))
+
+
 # --------------------------------------------------------------- 메시지 조립
 def value_row(rank: int, r: dict, show_market: bool) -> str:
     tag = f"[{'코스피' if r['market'] == 'KOSPI' else '코스닥'}] " if show_market else ""
@@ -216,9 +309,10 @@ def value_row(rank: int, r: dict, show_market: bool) -> str:
 
 
 def popular_row(rank: int, r: dict) -> str:
+    extra = f" · 🔍 {r['ratio']}" if r.get("ratio") else ""
     return (
         f"{rank_mark(rank)} {r['name']} ({r['code']})\n"
-        f"      {int(r['price']):,}원 {rate_mark(r['rate'])}{r['rate']:+.2f}% · 🔍 {r['ratio']}"
+        f"      {int(r['price']):,}원 {rate_mark(r['rate'])}{r['rate']:+.2f}%{extra}"
     )
 
 
@@ -275,7 +369,7 @@ def build_sections() -> list[str]:
         sections.append(
             section(
                 f"🔎🌟 인기종목 TOP {TOP_N} 🌟🔎",
-                "(네이버 증권 검색상위 · ETF·ETN 제외)",
+                "(네이버 증권 TOP · ETF·ETN 제외)",
                 [popular_row(i, r) for i, r in enumerate(pop, 1)],
             )
         )
