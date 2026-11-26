@@ -14,8 +14,9 @@ CHAT_ID = (
 ).strip()
 
 TOP_N = 20
-MAX_PAGES = 5          # 시장별 시총 상위 100개 x 5페이지 = 500종목에서 거래대금 정렬
+MAX_PAGES = 5            # 시장별 시총 상위 100개 x 5페이지 = 500종목에서 거래대금 정렬
 SPLIT_BY_MARKET = False  # True: 코스피 20 + 코스닥 20 따로 / False: 합쳐서 20
+LINE = "━━━━━━━━━━━━━━━━━━"
 
 HEADERS = {
     "User-Agent": (
@@ -34,6 +35,7 @@ ETF_ETN_BRANDS = (
 )
 
 
+# ---------------------------------------------------------------- 공통 유틸
 def is_etf_or_etn(name: str) -> bool:
     n = (name or "").strip().upper()
     if re.search(r"\b(ETF|ETN)\b", n):
@@ -65,7 +67,19 @@ def fmt_value(won_million: float) -> str:
     return f"{eok:,}억"
 
 
-# ---------- 1순위: 네이버 모바일 API ----------
+def rank_mark(rank: int) -> str:
+    return {1: "🥇", 2: "🥈", 3: "🥉"}.get(rank, f"{rank}.")
+
+
+def rate_mark(rate: float) -> str:
+    if rate > 0:
+        return "🔺"
+    if rate < 0:
+        return "🔻"
+    return "➖"
+
+
+# ------------------------------------------------ 거래대금: 네이버 모바일 API
 def fetch_mobile_api(market: str) -> list[dict]:
     out = []
     for page in range(1, MAX_PAGES + 1):
@@ -103,7 +117,7 @@ def fetch_mobile_api(market: str) -> list[dict]:
     return out
 
 
-# ---------- 2순위: 네이버 PC 증권 거래상위 표 ----------
+# ------------------------------------------- 거래대금: 네이버 PC 거래상위 표
 def fetch_pc_page(market: str) -> list[dict]:
     sosok = 0 if market == "KOSPI" else 1
     url = f"https://finance.naver.com/sise/sise_quant.naver?sosok={sosok}"
@@ -153,34 +167,128 @@ def fetch_market(market: str) -> list[dict]:
     raise RuntimeError(f"{market} 모든 소스 실패 | " + " / ".join(errors))
 
 
-def fmt_row(rank: int, r: dict, show_market: bool) -> str:
+# ---------------------------------------------- 인기검색어: 네이버 검색상위
+def fetch_popular() -> list[dict]:
+    url = "https://finance.naver.com/sise/lastsearch2.naver"
+    res = requests.get(url, headers=HEADERS, timeout=15)
+    res.raise_for_status()
+    soup = BeautifulSoup(res.content.decode("euc-kr", errors="ignore"), "html.parser")
+    out, seen = [], set()
+    for tr in soup.select("tr"):
+        a = tr.select_one("a[href*='code=']")
+        if a is None:
+            continue
+        m = re.search(r"code=(\w{6})", a.get("href", ""))
+        if not m:
+            continue
+        code, name = m.group(1), a.get_text(strip=True)
+        if code in seen or not name or is_etf_or_etn(name):
+            continue
+        cells = [td.get_text(strip=True) for td in tr.find_all("td")]
+        if name not in cells:
+            continue
+        i = cells.index(name)
+        # 열 순서: 종목명 | 검색비율 | 현재가 | 전일비 | 등락률 | ...
+        if len(cells) <= i + 4:
+            continue
+        seen.add(code)
+        out.append(
+            {
+                "name": name,
+                "code": code,
+                "ratio": cells[i + 1],
+                "price": to_num(cells[i + 2]),
+                "rate": to_num(cells[i + 4]),
+            }
+        )
+    if not out:
+        raise RuntimeError("검색상위 페이지에서 종목을 읽지 못했습니다.")
+    return out
+
+
+# --------------------------------------------------------------- 메시지 조립
+def value_row(rank: int, r: dict, show_market: bool) -> str:
     tag = f"[{'코스피' if r['market'] == 'KOSPI' else '코스닥'}] " if show_market else ""
     return (
-        f"{rank}. {tag}{r['name']} ({r['code']}) : "
-        f"{int(r['price']):,}원 ({r['rate']:+.2f}%) | {fmt_value(r['value'])}"
+        f"{rank_mark(rank)} {tag}{r['name']} ({r['code']})\n"
+        f"      {int(r['price']):,}원 {rate_mark(r['rate'])}{r['rate']:+.2f}% · 💵 {fmt_value(r['value'])}"
     )
 
 
-def build_message() -> str:
+def popular_row(rank: int, r: dict) -> str:
+    return (
+        f"{rank_mark(rank)} {r['name']} ({r['code']})\n"
+        f"      {int(r['price']):,}원 {rate_mark(r['rate'])}{r['rate']:+.2f}% · 🔍 {r['ratio']}"
+    )
+
+
+def section(title: str, sub: str, rows: list[str]) -> str:
+    # 제목 → 빈 줄 → 종목 (간격 여유)
+    head = f"{LINE}\n{title}\n{sub}\n"
+    return head + "\n" + "\n\n".join(rows)
+
+
+def build_sections() -> list[str]:
     kst = datetime.utcnow() + timedelta(hours=9)
     stamp = kst.strftime("%Y-%m-%d %H:%M")
-    kospi = fetch_market("KOSPI")
-    kosdaq = fetch_market("KOSDAQ")
+    sections = [f"✨📊 한국장 랭킹 리포트 📊✨\n🕗 {stamp} KST"]
+    failures = []
 
-    def top(rows):
-        return sorted(rows, key=lambda x: x["value"], reverse=True)[:TOP_N]
+    # 1) 거래대금
+    try:
+        kospi = fetch_market("KOSPI")
+        kosdaq = fetch_market("KOSDAQ")
 
-    if SPLIT_BY_MARKET:
-        lines = [f"📊 코스피 거래대금 TOP {TOP_N} ({stamp} KST · ETF·ETN 제외)\n"]
-        lines += [fmt_row(i, r, False) for i, r in enumerate(top(kospi), 1)]
-        lines += [f"\n📊 코스닥 거래대금 TOP {TOP_N}\n"]
-        lines += [fmt_row(i, r, False) for i, r in enumerate(top(kosdaq), 1)]
-    else:
-        lines = [f"📊 코스피·코스닥 거래대금 TOP {TOP_N} ({stamp} KST · ETF·ETN 제외)\n"]
-        lines += [fmt_row(i, r, True) for i, r in enumerate(top(kospi + kosdaq), 1)]
-    return "\n".join(lines)
+        def top(rows):
+            return sorted(rows, key=lambda x: x["value"], reverse=True)[:TOP_N]
+
+        if SPLIT_BY_MARKET:
+            sections.append(
+                section(
+                    f"💰🔥 코스피 거래대금 TOP {TOP_N} 🔥💰",
+                    "(ETF·ETN 제외)",
+                    [value_row(i, r, False) for i, r in enumerate(top(kospi), 1)],
+                )
+            )
+            sections.append(
+                section(
+                    f"💰🔥 코스닥 거래대금 TOP {TOP_N} 🔥💰",
+                    "(ETF·ETN 제외)",
+                    [value_row(i, r, False) for i, r in enumerate(top(kosdaq), 1)],
+                )
+            )
+        else:
+            sections.append(
+                section(
+                    f"💰🔥 거래대금 TOP {TOP_N} 🔥💰",
+                    "(코스피+코스닥 · ETF·ETN 제외)",
+                    [value_row(i, r, True) for i, r in enumerate(top(kospi + kosdaq), 1)],
+                )
+            )
+    except Exception as e:
+        failures.append(f"거래대금: {type(e).__name__}: {e}")
+        sections.append(f"{LINE}\n💰 거래대금 순위 수집 실패\n{type(e).__name__}: {e}")
+
+    # 2) 인기검색어
+    try:
+        pop = fetch_popular()[:TOP_N]
+        sections.append(
+            section(
+                f"🔎🌟 인기검색어 TOP {TOP_N} 🌟🔎",
+                "(네이버 증권 검색상위 · ETF·ETN 제외)",
+                [popular_row(i, r) for i, r in enumerate(pop, 1)],
+            )
+        )
+    except Exception as e:
+        failures.append(f"인기검색어: {type(e).__name__}: {e}")
+        sections.append(f"{LINE}\n🔎 인기검색어 순위 수집 실패\n{type(e).__name__}: {e}")
+
+    if len(failures) == 2:
+        raise RuntimeError(" | ".join(failures))
+    return sections
 
 
+# ------------------------------------------------------------------ 텔레그램
 def send_telegram(text: str):
     if not TELEGRAM_TOKEN or not CHAT_ID:
         raise ValueError("TELEGRAM_BOT_TOKEN 또는 TELEGRAM_CHAT_ID 환경변수가 비어 있습니다.")
@@ -193,13 +301,23 @@ def send_telegram(text: str):
     resp.raise_for_status()
 
 
+def send_sections(sections: list[str]):
+    """한 메시지(4096자 제한) 안에 들어가면 합쳐서, 넘치면 섹션별로 나눠 전송."""
+    full = "\n\n\n".join(sections)
+    if len(full) <= 4000:
+        send_telegram(full)
+        return
+    for s in sections:
+        send_telegram(s)
+
+
 if __name__ == "__main__":
     try:
-        msg = build_message()
+        secs = build_sections()
     except Exception as e:
         msg = f"⚠️ 순위 수집 실패\n{type(e).__name__}: {e}"
         print(msg)
         send_telegram(msg)
         raise SystemExit(1)
-    send_telegram(msg)
+    send_sections(secs)
     print("전송 완료")
