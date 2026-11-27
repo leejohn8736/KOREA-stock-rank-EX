@@ -8,7 +8,9 @@ Markdown
 
 ## 🔄 데이터 수집 우선순위  ( 실시간 검색 순위 ) 네이버 거래대금 순위와 인기검색 순위
 
-1. **네이버 금융 '검색상위 종목'** (`https://finance.naver.com/sise/lastsearch2.naver`) — 실시간 검색 순위 TOP 20 수집
+1. **네이버 증권  인기검색 순위 종목'** ( https://stock.naver.com/market/stock/kr/stocklist/top ) — 실시간 검색 순위 TOP 20 수집
+
+2. **네이버 증권  거래대금 순위 종목'** ( https://stock.naver.com/market/stock/kr/stocklist/priceTop ) — 실시간 검색 순위 TOP 20 수집
 
  
 
