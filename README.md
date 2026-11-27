@@ -6,7 +6,7 @@ Markdown
 
 ---
 
-## 🔄 데이터 수집 우선순위  ( 다음 금융 '실시간 검색 순위 ) 네이버 실패
+## 🔄 데이터 수집 우선순위  ( 다음 금융 '실시간 검색 순위 ) 네이버 거래대금 쉰위와 인기검색 순위와 
 
 1. **네이버 금융 '검색상위 종목'** (`https://finance.naver.com/sise/lastsearch2.naver`) — 실시간 검색 순위 TOP 20 수집
 2. **네이버 모바일 증권 시가총액 상위** (`https://m.stock.naver.com/api/stocks/marketValue/KOSPI`) — 대체 데이터(시가총액 기준)
