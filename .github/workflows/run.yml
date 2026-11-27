@@ -2,8 +2,12 @@ name: 한국장 랭킹 순위
 
 on:
   schedule:
-    # 한국시간(KST, UTC+9) 매일 오전 7시 50분 = UTC 22:50
-    - cron: "50 22 * * *"
+    # 한국시간(KST, UTC+9) 매일 08:00 ~ 21:00 매시 정각 실행 (총 14회)
+    # KST 08:00 = UTC 23:00 (전날)
+    # KST 09:00 ~ 21:00 = UTC 00:00 ~ 12:00
+    - cron: "0 23,0-12 * * *"
+  repository_dispatch:
+    types: [run-cron] # cron-job.org API 호출용
   workflow_dispatch: # Actions 탭에서 수동 테스트 실행 가능
 
 concurrency:
