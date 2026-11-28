@@ -25,9 +25,6 @@ LINE = "━━━━━━━━━━━━━━━━━━"
 
 STATE_FILE = "last_rank.json"
 NEWS_MAX_STOCKS = int(os.environ.get("NEWS_MAX_STOCKS", "30"))  # 재료 조회할 최대 종목 수
-NEWS_PER_STOCK = 3
-NOTICE_PER_STOCK = 2
-GOOGLE_NEWS_PER_STOCK = int(os.environ.get("GOOGLE_NEWS_PER_STOCK", "5"))  # 종목당 구글뉴스 개수
 GOOGLE_NEWS_DAYS = int(os.environ.get("GOOGLE_NEWS_DAYS", "3"))  # 최근 N일 기사만
 
 THEME_KEYWORDS = {
@@ -417,7 +414,8 @@ def send_telegram(text: str, use_html: bool = False):
     if use_html:
         payload["parse_mode"] = "HTML"
     resp = requests.post(url, json=payload, timeout=15)
-    resp.raise_for_status()
+    if not resp.ok:  # URL(토큰 포함)은 빼고 텔레그램이 알려준 원인만 표시
+        raise RuntimeError(f"Telegram {resp.status_code}: {resp.text[:300]}")
 
 
 def send_sections(sections: list[str]):
@@ -454,58 +452,63 @@ def load_state() -> list[dict]:
         return []
 
 
-# ------------------------------------------------- 뉴스 / 공시 / 실적 수집
-def _news_link(href: str) -> str:
-    oid = re.search(r"office_id=(\d+)", href)
-    aid = re.search(r"article_id=(\d+)", href)
-    if oid and aid:
-        return f"https://n.news.naver.com/mnews/article/{oid.group(1)}/{aid.group(1)}"
-    if href.startswith("/"):
-        return "https://finance.naver.com" + href
-    return href
+# ------------------------------------------------- 뉴스 / 재료 / 실적 수집
+# (네이버 뉴스·공시 페이지는 410으로 막혀서 구글 뉴스 검색으로 대체)
+def esc(t) -> str:
+    return str(t).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def _fetch_list(path: str, code: str, limit: int) -> list[dict]:
-    res = requests.get(
-        f"https://finance.naver.com/item/{path}",
-        params={"code": code, "page": 1},
-        headers={**HEADERS, "Referer": f"https://finance.naver.com/item/news.naver?code={code}"},
-        timeout=15,
-    )
-    res.raise_for_status()
-    soup = BeautifulSoup(res.content.decode("euc-kr", errors="ignore"), "html.parser")
+def esc_attr(t) -> str:
+    return esc(t).replace('"', "&quot;")
+
+
+def _google_rss(query: str, limit: int) -> list[dict]:
+    last_err = None
+    for _ in range(2):
+        try:
+            res = requests.get(
+                "https://news.google.com/rss/search",
+                params={"q": query, "hl": "ko", "gl": "KR", "ceid": "KR:ko"},
+                headers={"User-Agent": HEADERS["User-Agent"]},
+                timeout=15,
+            )
+            res.raise_for_status()
+            break
+        except Exception as e:
+            last_err = e
+            time.sleep(2)
+    else:
+        raise last_err
+    root = ET.fromstring(res.content)
     out, seen = [], set()
-    for tr in soup.select("tr"):
-        if "relation_lst" in (tr.get("class") or []):
-            continue
-        a = tr.select_one("td.title a")
-        if a is None:
-            continue
-        title = a.get_text(strip=True)
-        if not title or title in seen:
+    for it in root.iter("item"):
+        title = (it.findtext("title") or "").strip()
+        link = (it.findtext("link") or "").strip()
+        src = (it.findtext("source") or "").strip()
+        if src and title.endswith(" - " + src):
+            title = title[: -len(src) - 3].strip()
+        if not title or not link or title in seen:
             continue
         seen.add(title)
-        info = tr.select_one("td.info")
-        date = tr.select_one("td.date")
-        out.append(
-            {
-                "title": title,
-                "url": _news_link(a.get("href", "")),
-                "src": info.get_text(strip=True) if info else "",
-                "date": date.get_text(strip=True) if date else "",
-            }
-        )
+        out.append({"title": title, "url": link, "src": src})
         if len(out) >= limit:
             break
     return out
 
 
-def fetch_news(code: str) -> list[dict]:
-    return _fetch_list("news_news.naver", code, NEWS_PER_STOCK)
-
-
-def fetch_notices(code: str) -> list[dict]:
-    return _fetch_list("news_notice.naver", code, NOTICE_PER_STOCK)
+def fetch_google(name: str):
+    """(최신 뉴스, 재료·공시·실적 뉴스) 구글 뉴스 검색 결과"""
+    news = _google_rss(f'"{name}" 주식 when:{GOOGLE_NEWS_DAYS}d', 8)
+    time.sleep(0.3)
+    try:
+        mats = _google_rss(
+            f'"{name}" (공시 OR 영업이익 OR 매출 OR 수주 OR 계약 OR 테마 OR 관련주) when:{GOOGLE_NEWS_DAYS}d', 8
+        )
+    except Exception as e:
+        print(f"[안내] 재료검색 실패 {name}: {e}")
+        mats = []
+    seen = {x["title"] for x in news}
+    return news, [x for x in mats if x["title"] not in seen]
 
 
 def fetch_earnings(code: str) -> str:
@@ -532,49 +535,34 @@ def fetch_earnings(code: str) -> str:
     )
 
 
-def fetch_google_news(name: str) -> list[dict]:
-    """구글 뉴스 RSS 검색: 최근 N일 기사 (제목/링크/언론사/시각)."""
-    res = requests.get(
-        "https://news.google.com/rss/search",
-        params={"q": f'"{name}" 주식 when:{GOOGLE_NEWS_DAYS}d', "hl": "ko", "gl": "KR", "ceid": "KR:ko"},
-        headers={"User-Agent": HEADERS["User-Agent"]},
-        timeout=15,
-    )
-    res.raise_for_status()
-    root = ET.fromstring(res.content)
-    out, seen = [], set()
-    for it in root.iter("item"):
-        title = (it.findtext("title") or "").strip()
-        link = (it.findtext("link") or "").strip()
-        src = (it.findtext("source") or "").strip()
-        if src and title.endswith(" - " + src):
-            title = title[: -len(src) - 3].strip()
-        if not title or not link or title in seen:
-            continue
-        seen.add(title)
-        date = ""
-        try:
-            d = parsedate_to_datetime(it.findtext("pubDate") or "")
-            date = d.astimezone(timezone(timedelta(hours=9))).strftime("%m/%d %H:%M")
-        except Exception:
-            pass
-        out.append({"title": title, "url": link, "src": src, "date": date})
-        if len(out) >= GOOGLE_NEWS_PER_STOCK:
-            break
-    return out
-
-
 def theme_tags(texts: list[str]) -> list[str]:
     blob = " ".join(texts)
     return [tag for tag, kws in THEME_KEYWORDS.items() if any(k in blob for k in kws)]
 
 
-def a_tag(item: dict, prefix: str = "•", tlen: int = 45) -> str:
+def collect_stock_data(s: dict) -> dict:
+    d = {"news": [], "mats": [], "earn": "", "tags": []}
+    try:
+        d["news"], d["mats"] = fetch_google(s["name"])
+    except Exception as e:
+        print(f"[안내] 구글뉴스 실패 {s['name']}: {e}")
+    try:
+        d["earn"] = fetch_earnings(s["code"])
+    except Exception as e:
+        print(f"[안내] 실적 실패 {s['name']}: {e}")
+    d["tags"] = theme_tags([x["title"] for x in d["news"] + d["mats"]])
+    return d
+
+
+# ------------------------------------------------------------ 메시지 조립(재료)
+SEP = "┈┈┈┈┈┈┈┈┈┈┈┈┈┈"
+
+
+def a_tag(item: dict, tlen: int) -> str:
     t = item["title"]
     t = t if len(t) <= tlen else t[: tlen - 1] + "…"
-    link = f'<a href="{html.escape(item["url"], quote=True)}">{html.escape(t)}</a>'
     src = (item.get("src") or "")[:8]
-    return f"{prefix} {link}" + (f" <i>({html.escape(src)})</i>" if src else "")
+    return f'  ▫️ <a href="{esc_attr(item["url"])}">{esc(t)}</a>' + (f" · {esc(src)}" if src else "")
 
 
 def visible_len(text: str) -> int:
@@ -582,81 +570,92 @@ def visible_len(text: str) -> int:
     return len(html.unescape(re.sub(r"<[^>]+>", "", text)))
 
 
-def collect_stock_data(s: dict) -> dict:
-    code, name = s["code"], s["name"]
-    d = {"gnews": [], "news": [], "notices": [], "earn": "", "tags": []}
-    for key, fn, arg in (
-        ("gnews", fetch_google_news, name),
-        ("news", fetch_news, code),
-        ("notices", fetch_notices, code),
-        ("earn", fetch_earnings, code),
-    ):
-        try:
-            d[key] = fn(arg)
-        except Exception as e:
-            print(f"[안내] {key} 실패 {name}: {e}")
-    d["tags"] = theme_tags([n["title"] for n in d["gnews"] + d["news"] + d["notices"]])
-    return d
+def count_entities(text: str) -> int:
+    """텔레그램은 메시지당 서식/링크 개수 제한(100)이 있음."""
+    return len(re.findall(r"<(?:b|a|i)[ >]", text))
 
 
-def format_stock(rank: int, s: dict, d: dict, g: int, n: int, ds: int, tlen: int) -> str:
+def format_stock(rank: int, s: dict, d: dict, g: int, m: int, tlen: int) -> str:
     code, name = s["code"], s["name"]
-    lines = [f"<b>{rank}. {html.escape(name)}</b> ({code})"]
+    rate = float(s.get("rate") or 0)
+    lines = [SEP, f"{rank_mark(rank)} <b>{esc(name)}</b> ({code})  {rate_mark(rate)}{rate:+.2f}%"]
     if d["tags"]:
         lines.append("🏷 " + " / ".join(d["tags"]))
     if d["earn"]:
-        lines.append(f"📈 {html.escape(d['earn'])}")
+        lines.append(f"📈 {esc(d['earn'])}")
     more = f"https://news.google.com/search?q={quote(name + ' 주식')}&hl=ko&gl=KR&ceid=KR:ko"
     lines.append(
         f'🔗 <a href="https://finance.naver.com/item/main.naver?code={code}">종목페이지</a>'
-        f' · 🌐 <a href="{html.escape(more, quote=True)}">구글뉴스 전체</a>'
+        f'  ·  🌐 <a href="{esc_attr(more)}">구글뉴스 전체</a>'
     )
-    items = (
-        [a_tag(x, "•", tlen) for x in d["gnews"][:g]]
-        + [a_tag(x, "📰", tlen) for x in d["news"][:n]]
-        + [a_tag(x, "📑", tlen) for x in d["notices"][:ds]]
-    )
-    lines += items or ["• (최근 기사 없음)"]
+    if d["news"][:g]:
+        lines.append("📰 <b>뉴스</b>")
+        lines += [a_tag(x, tlen) for x in d["news"][:g]]
+    if d["mats"][:m]:
+        lines.append("💡 <b>재료·공시·실적</b>")
+        lines += [a_tag(x, tlen) for x in d["mats"][:m]]
+    if not (d["news"][:g] or d["mats"][:m]):
+        lines.append("💤 최근 기사 없음")
     return "\n".join(lines)
 
 
-# 한 메시지(4000자)에 안 들어가면 위에서부터 차례로 줄여서 재시도: (구글뉴스, 네이버뉴스, 공시, 제목길이)
-LADDER = [
-    (5, 2, 2, 45), (4, 2, 1, 42), (3, 1, 1, 38), (3, 1, 0, 35),
-    (2, 1, 0, 32), (2, 0, 0, 30), (1, 0, 0, 28),
-]
+# 한 메시지에 안 들어가면 위에서부터 차례로 줄여서 재시도: (뉴스 수, 재료 수, 제목 길이)
+LADDER = [(3, 3, 44), (3, 2, 42), (2, 2, 40), (2, 1, 38), (1, 1, 36), (1, 0, 34), (1, 0, 28)]
+MAX_CHARS = 4000
+MAX_ENTITIES = 90
 
 
-def build_two_messages(targets: list[dict], data: dict, header: str) -> list[str]:
-    half = (len(targets) + 1) // 2
-    groups = [(1, targets[:half])]
-    if targets[half:]:
-        groups.append((half + 1, targets[half:]))
-    total = len(groups)
+def split_groups(targets: list[dict], k: int) -> list[tuple]:
+    base, extra = divmod(len(targets), k)
+    groups, pos = [], 0
+    for i in range(k):
+        size = base + (1 if i < extra else 0)
+        if size:
+            groups.append((pos + 1, targets[pos : pos + size]))
+        pos += size
+    return groups
 
+
+def build_messages(targets: list[dict], data: dict, note: str) -> list[str]:
+    """먼저 2개 메시지로 시도하고, 너무 줄여야 하면 3개로 나눔."""
+    kst = datetime.utcnow() + timedelta(hours=9)
+    stamp = f"🕗 {kst:%Y-%m-%d %H:%M} KST · {note}"
     msgs = []
-    for ci, cfg in enumerate(LADDER):
-        last = ci == len(LADDER) - 1
-        msgs, ok = [], True
-        for gi, (start, grp) in enumerate(groups):
-            if gi == 0:
-                head = header.replace("{part}", f" ({gi + 1}/{total})" if total > 1 else "")
-            else:
-                head = f"🗞️ <b>종목 재료 리포트 ({gi + 1}/{total})</b>"
-            blocks = [format_stock(start + i, x, data[x["code"]], *cfg) for i, x in enumerate(grp)]
-            msg = head + "\n\n" + "\n\n".join(blocks)
-            if visible_len(msg) > 4000:
-                if not last:
-                    ok = False
-                    break
-                while visible_len(msg) > 4000 and len(blocks) > 1:  # 최후 수단: 뒤쪽 종목 삭제
-                    blocks.pop()
-                    msg = head + "\n\n" + "\n\n".join(blocks)
-            msgs.append(msg)
-        if ok:
-            print(f"[안내] 압축 단계 {ci + 1}/{len(LADDER)} 적용 {cfg}")
-            return msgs
+    for k, ladder in ((2, LADDER[:4]), (3, LADDER)):
+        groups = split_groups(targets, k)
+        total = len(groups)
+        for ci, cfg in enumerate(ladder):
+            last = k == 3 and ci == len(ladder) - 1
+            msgs, ok = [], True
+            for gi, (start, grp) in enumerate(groups):
+                part = f" ({gi + 1}/{total})" if total > 1 else ""
+                head = f"🗞️✨ <b>종목 재료 리포트{part}</b> ✨🗞️"
+                if gi == 0:
+                    head += "\n" + stamp
+                blocks = [format_stock(start + i, x, data[x["code"]], *cfg) for i, x in enumerate(grp)]
+                msg = head + "\n\n" + "\n\n".join(blocks)
+                too_big = lambda t: visible_len(t) > MAX_CHARS or count_entities(t) > MAX_ENTITIES
+                if too_big(msg):
+                    if not last:
+                        ok = False
+                        break
+                    while too_big(msg) and len(blocks) > 1:  # 최후 수단: 뒤쪽 종목 삭제
+                        blocks.pop()
+                        msg = head + "\n\n" + "\n\n".join(blocks)
+                msgs.append(msg)
+            if ok:
+                print(f"[안내] {total}개 메시지 / 압축 단계 {ci + 1} 적용 {cfg}")
+                return msgs
     return msgs
+
+
+def send_news_message(m: str):
+    try:
+        send_telegram(m, use_html=True)
+    except Exception as e:
+        print(f"[안내] HTML 전송 실패, 일반 텍스트로 재시도: {e}")
+        plain = html.unescape(re.sub(r"<[^>]+>", "", m))[:4000]
+        send_telegram(plain)
 
 
 # ------------------------------------------------------------------ 실행 모드
@@ -668,16 +667,17 @@ def run_news():
         targets = dedupe(picked)
         note = "저장된 순위가 없어 현재 순위 기준"
     targets = targets[:NEWS_MAX_STOCKS]
+    if not targets:
+        send_telegram("🗞️ 재료를 조회할 종목이 없습니다.")
+        return
 
     data = {}
     for s in targets:
         data[s["code"]] = collect_stock_data(s)
         time.sleep(0.3)
 
-    kst = datetime.utcnow() + timedelta(hours=9)
-    header = f"🗞️ <b>종목 재료 리포트{{part}}</b>\n🕗 {kst:%Y-%m-%d %H:%M} KST · {note}"
-    for m in build_two_messages(targets, data, header):
-        send_telegram(m, use_html=True)
+    for m in build_messages(targets, data, note):
+        send_news_message(m)
         time.sleep(1.2)
 
 
