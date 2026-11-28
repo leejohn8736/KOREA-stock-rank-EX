@@ -1,3 +1,4 @@
+import base64
 import html
 import json
 import os
@@ -462,6 +463,60 @@ def esc_attr(t) -> str:
     return esc(t).replace('"', "&quot;")
 
 
+def decode_gnews_url(url: str) -> str:
+    """구글뉴스 링크 안에 원문 주소가 들어있으면(구형 포맷) 꺼내서 직링크로 사용."""
+    m = re.search(r"/articles/([A-Za-z0-9_-]+)", url)
+    if not m:
+        return url
+    try:
+        raw = base64.urlsafe_b64decode(m.group(1) + "=" * (-len(m.group(1)) % 4))
+        found = re.search(r"https?://[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+", raw.decode("latin1"))
+        return found.group(0) if found else url
+    except Exception:
+        return url
+
+
+def _walk_news(obj, out: list):
+    if isinstance(obj, list):
+        for x in obj:
+            _walk_news(x, out)
+    elif isinstance(obj, dict):
+        if obj.get("officeId") and obj.get("articleId") and (obj.get("title") or obj.get("titleFull")):
+            out.append(obj)
+        for v in obj.values():
+            if isinstance(v, (dict, list)):
+                _walk_news(v, out)
+
+
+def fetch_naver_news(code: str, limit: int = 8) -> list[dict]:
+    """네이버 증권 종목뉴스 API -> 네이버 뉴스 원문 직링크 (n.news.naver.com)."""
+    res = requests.get(
+        f"https://m.stock.naver.com/api/news/stock/{code}",
+        params={"pageSize": 10, "page": 1},
+        headers=HEADERS,
+        timeout=15,
+    )
+    res.raise_for_status()
+    found: list = []
+    _walk_news(res.json(), found)
+    out, seen = [], set()
+    for it in found:
+        title = html.unescape(re.sub(r"<[^>]+>", "", str(it.get("title") or it.get("titleFull")))).strip()
+        if not title or title in seen:
+            continue
+        seen.add(title)
+        out.append(
+            {
+                "title": title,
+                "url": f"https://n.news.naver.com/mnews/article/{it['officeId']}/{it['articleId']}",
+                "src": str(it.get("officeName") or ""),
+            }
+        )
+        if len(out) >= limit:
+            break
+    return out
+
+
 def _google_rss(query: str, limit: int) -> list[dict]:
     last_err = None
     for _ in range(2):
@@ -490,7 +545,7 @@ def _google_rss(query: str, limit: int) -> list[dict]:
         if not title or not link or title in seen:
             continue
         seen.add(title)
-        out.append({"title": title, "url": link, "src": src})
+        out.append({"title": title, "url": re.sub(r"\?oc=\d+$", "", decode_gnews_url(link)), "src": src})
         if len(out) >= limit:
             break
     return out
@@ -542,10 +597,18 @@ def theme_tags(texts: list[str]) -> list[str]:
 
 def collect_stock_data(s: dict) -> dict:
     d = {"news": [], "mats": [], "earn": "", "tags": []}
+    naver = []
     try:
-        d["news"], d["mats"] = fetch_google(s["name"])
+        naver = fetch_naver_news(s["code"])
+    except Exception as e:
+        print(f"[안내] 네이버뉴스 실패 {s['name']}: {e}")
+    try:
+        gnews, d["mats"] = fetch_google(s["name"])
     except Exception as e:
         print(f"[안내] 구글뉴스 실패 {s['name']}: {e}")
+        gnews = []
+    seen = {x["title"] for x in naver}
+    d["news"] = naver + [x for x in gnews if x["title"] not in seen]
     try:
         d["earn"] = fetch_earnings(s["code"])
     except Exception as e:
@@ -562,7 +625,8 @@ def a_tag(item: dict, tlen: int) -> str:
     t = item["title"]
     t = t if len(t) <= tlen else t[: tlen - 1] + "…"
     src = (item.get("src") or "")[:8]
-    return f'  ▫️ <a href="{esc_attr(item["url"])}">{esc(t)}</a>' + (f" · {esc(src)}" if src else "")
+    first = f'  ▫️ <a href="{esc_attr(item["url"])}">{esc(t)}</a>' + (f" · {esc(src)}" if src else "")
+    return first + f"\n      🔗 {esc(item['url'])}"  # 링크가 안 눌려도 주소가 그대로 보이게
 
 
 def visible_len(text: str) -> int:
@@ -571,23 +635,25 @@ def visible_len(text: str) -> int:
 
 
 def count_entities(text: str) -> int:
-    """텔레그램은 메시지당 서식/링크 개수 제한(100)이 있음."""
-    return len(re.findall(r"<(?:b|a|i)[ >]", text))
+    """텔레그램은 메시지당 서식/링크 개수 제한(100)이 있음. 태그 + 화면에 보이는 주소 개수."""
+    tags = len(re.findall(r"<(?:b|a|i)[ >]", text))
+    bare = len(re.findall(r"https?://", re.sub(r"<[^>]+>", "", text)))
+    return tags + bare
 
 
 def format_stock(rank: int, s: dict, d: dict, g: int, m: int, tlen: int) -> str:
     code, name = s["code"], s["name"]
     rate = float(s.get("rate") or 0)
+    page = f"https://finance.naver.com/item/main.naver?code={code}"
     lines = [SEP, f"{rank_mark(rank)} <b>{esc(name)}</b> ({code})  {rate_mark(rate)}{rate:+.2f}%"]
     if d["tags"]:
         lines.append("🏷 " + " / ".join(d["tags"]))
     if d["earn"]:
         lines.append(f"📈 {esc(d['earn'])}")
+    lines.append(f'🔗 <a href="{page}">종목페이지</a>')
+    lines.append(f"      {page}")  # 글씨 바로 아래에 주소 그대로 표시
     more = f"https://news.google.com/search?q={quote(name + ' 주식')}&hl=ko&gl=KR&ceid=KR:ko"
-    lines.append(
-        f'🔗 <a href="https://finance.naver.com/item/main.naver?code={code}">종목페이지</a>'
-        f'  ·  🌐 <a href="{esc_attr(more)}">구글뉴스 전체</a>'
-    )
+    lines.append(f'🌐 <a href="{esc_attr(more)}">구글뉴스 전체 보기</a>')
     if d["news"][:g]:
         lines.append("📰 <b>뉴스</b>")
         lines += [a_tag(x, tlen) for x in d["news"][:g]]
@@ -600,7 +666,7 @@ def format_stock(rank: int, s: dict, d: dict, g: int, m: int, tlen: int) -> str:
 
 
 # 한 메시지에 안 들어가면 위에서부터 차례로 줄여서 재시도: (뉴스 수, 재료 수, 제목 길이)
-LADDER = [(5, 4, 48), (4, 3, 44), (3, 3, 44), (3, 2, 42), (2, 2, 40), (2, 1, 38), (1, 1, 34), (1, 0, 28)]
+LADDER = [(3, 2, 44), (3, 1, 42), (2, 2, 40), (2, 1, 38), (2, 0, 36), (1, 1, 34), (1, 0, 30), (1, 0, 24)]
 MAX_CHARS = 4000
 MAX_ENTITIES = 90
 NEWS_MESSAGES = int(os.environ.get("NEWS_MESSAGES", "5"))  # 재료 리포트를 나눠 보낼 메시지 수
