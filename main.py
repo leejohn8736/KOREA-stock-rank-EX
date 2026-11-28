@@ -3,7 +3,10 @@ import json
 import os
 import re
 import time
-from datetime import datetime, timedelta
+import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
+from urllib.parse import quote
 
 import requests
 from bs4 import BeautifulSoup
@@ -24,6 +27,8 @@ STATE_FILE = "last_rank.json"
 NEWS_MAX_STOCKS = int(os.environ.get("NEWS_MAX_STOCKS", "30"))  # 재료 조회할 최대 종목 수
 NEWS_PER_STOCK = 3
 NOTICE_PER_STOCK = 2
+GOOGLE_NEWS_PER_STOCK = int(os.environ.get("GOOGLE_NEWS_PER_STOCK", "5"))  # 종목당 구글뉴스 개수
+GOOGLE_NEWS_DAYS = int(os.environ.get("GOOGLE_NEWS_DAYS", "3"))  # 최근 N일 기사만
 
 THEME_KEYWORDS = {
     "📦 수주·계약": ["수주", "계약", "공급", "납품", "MOU"],
@@ -527,6 +532,38 @@ def fetch_earnings(code: str) -> str:
     )
 
 
+def fetch_google_news(name: str) -> list[dict]:
+    """구글 뉴스 RSS 검색: 최근 N일 기사 (제목/링크/언론사/시각)."""
+    res = requests.get(
+        "https://news.google.com/rss/search",
+        params={"q": f'"{name}" 주식 when:{GOOGLE_NEWS_DAYS}d', "hl": "ko", "gl": "KR", "ceid": "KR:ko"},
+        headers={"User-Agent": HEADERS["User-Agent"]},
+        timeout=15,
+    )
+    res.raise_for_status()
+    root = ET.fromstring(res.content)
+    out, seen = [], set()
+    for it in root.iter("item"):
+        title = (it.findtext("title") or "").strip()
+        link = (it.findtext("link") or "").strip()
+        src = (it.findtext("source") or "").strip()
+        if src and title.endswith(" - " + src):
+            title = title[: -len(src) - 3].strip()
+        if not title or not link or title in seen:
+            continue
+        seen.add(title)
+        date = ""
+        try:
+            d = parsedate_to_datetime(it.findtext("pubDate") or "")
+            date = d.astimezone(timezone(timedelta(hours=9))).strftime("%m/%d %H:%M")
+        except Exception:
+            pass
+        out.append({"title": title, "url": link, "src": src, "date": date})
+        if len(out) >= GOOGLE_NEWS_PER_STOCK:
+            break
+    return out
+
+
 def theme_tags(texts: list[str]) -> list[str]:
     blob = " ".join(texts)
     return [tag for tag, kws in THEME_KEYWORDS.items() if any(k in blob for k in kws)]
@@ -543,7 +580,11 @@ def a_tag(item: dict) -> str:
 
 def build_stock_block(rank: int, s: dict) -> str:
     code, name = s["code"], s["name"]
-    news, notices, earn = [], [], ""
+    gnews, news, notices, earn = [], [], [], ""
+    try:
+        gnews = fetch_google_news(name)
+    except Exception as e:
+        print(f"[안내] 구글뉴스 실패 {name}: {e}")
     try:
         news = fetch_news(code)
     except Exception as e:
@@ -558,20 +599,25 @@ def build_stock_block(rank: int, s: dict) -> str:
         print(f"[안내] 실적 실패 {name}: {e}")
 
     lines = [f"<b>{rank}. {html.escape(name)}</b> ({code})"]
-    tags = theme_tags([n["title"] for n in news + notices])
+    tags = theme_tags([n["title"] for n in gnews + news + notices])
     if tags:
         lines.append("🏷 " + " / ".join(tags))
     if earn:
         lines.append(f"📈 {html.escape(earn)}")
+    lines.append(f'🔗 <a href="https://finance.naver.com/item/main.naver?code={code}">종목 페이지</a>')
+
+    more = f"https://news.google.com/search?q={quote(name + ' 주식')}&hl=ko&gl=KR&ceid=KR:ko"
+    lines.append(f'🌐 구글 뉴스 (<a href="{html.escape(more, quote=True)}">전체 보기</a>)')
+    if gnews:
+        lines += [a_tag(n) for n in gnews]
+    else:
+        lines.append("• (최근 기사 없음)")
     if news:
-        lines.append("📰 뉴스")
+        lines.append("📰 네이버 뉴스")
         lines += [a_tag(n) for n in news]
     if notices:
         lines.append("📑 공시")
         lines += [a_tag(n) for n in notices]
-    if not (news or notices or earn):
-        lines.append("(수집된 재료 없음)")
-    lines.append(f'🔗 <a href="https://finance.naver.com/item/main.naver?code={code}">종목 페이지</a>')
     return "\n".join(lines)
 
 
@@ -600,6 +646,7 @@ def run_news():
     chunks.append(cur)
     for c in chunks:
         send_telegram(c, use_html=True)
+        time.sleep(1.2)  # 텔레그램 연속 전송 제한 회피
 
 
 def run_rank():
