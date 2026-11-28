@@ -569,56 +569,94 @@ def theme_tags(texts: list[str]) -> list[str]:
     return [tag for tag, kws in THEME_KEYWORDS.items() if any(k in blob for k in kws)]
 
 
-def a_tag(item: dict) -> str:
+def a_tag(item: dict, prefix: str = "•", tlen: int = 45) -> str:
     t = item["title"]
-    t = t if len(t) <= 55 else t[:54] + "…"
-    meta = " · ".join(x for x in (item["src"], item["date"]) if x)
-    return f'• <a href="{html.escape(item["url"], quote=True)}">{html.escape(t)}</a>' + (
-        f" <i>({html.escape(meta)})</i>" if meta else ""
-    )
+    t = t if len(t) <= tlen else t[: tlen - 1] + "…"
+    link = f'<a href="{html.escape(item["url"], quote=True)}">{html.escape(t)}</a>'
+    src = (item.get("src") or "")[:8]
+    return f"{prefix} {link}" + (f" <i>({html.escape(src)})</i>" if src else "")
 
 
-def build_stock_block(rank: int, s: dict) -> str:
+def visible_len(text: str) -> int:
+    """텔레그램 글자수 제한은 태그·URL을 뺀 보이는 글자 기준."""
+    return len(html.unescape(re.sub(r"<[^>]+>", "", text)))
+
+
+def collect_stock_data(s: dict) -> dict:
     code, name = s["code"], s["name"]
-    gnews, news, notices, earn = [], [], [], ""
-    try:
-        gnews = fetch_google_news(name)
-    except Exception as e:
-        print(f"[안내] 구글뉴스 실패 {name}: {e}")
-    try:
-        news = fetch_news(code)
-    except Exception as e:
-        print(f"[안내] 뉴스 실패 {name}: {e}")
-    try:
-        notices = fetch_notices(code)
-    except Exception as e:
-        print(f"[안내] 공시 실패 {name}: {e}")
-    try:
-        earn = fetch_earnings(code)
-    except Exception as e:
-        print(f"[안내] 실적 실패 {name}: {e}")
+    d = {"gnews": [], "news": [], "notices": [], "earn": "", "tags": []}
+    for key, fn, arg in (
+        ("gnews", fetch_google_news, name),
+        ("news", fetch_news, code),
+        ("notices", fetch_notices, code),
+        ("earn", fetch_earnings, code),
+    ):
+        try:
+            d[key] = fn(arg)
+        except Exception as e:
+            print(f"[안내] {key} 실패 {name}: {e}")
+    d["tags"] = theme_tags([n["title"] for n in d["gnews"] + d["news"] + d["notices"]])
+    return d
 
+
+def format_stock(rank: int, s: dict, d: dict, g: int, n: int, ds: int, tlen: int) -> str:
+    code, name = s["code"], s["name"]
     lines = [f"<b>{rank}. {html.escape(name)}</b> ({code})"]
-    tags = theme_tags([n["title"] for n in gnews + news + notices])
-    if tags:
-        lines.append("🏷 " + " / ".join(tags))
-    if earn:
-        lines.append(f"📈 {html.escape(earn)}")
-    lines.append(f'🔗 <a href="https://finance.naver.com/item/main.naver?code={code}">종목 페이지</a>')
-
+    if d["tags"]:
+        lines.append("🏷 " + " / ".join(d["tags"]))
+    if d["earn"]:
+        lines.append(f"📈 {html.escape(d['earn'])}")
     more = f"https://news.google.com/search?q={quote(name + ' 주식')}&hl=ko&gl=KR&ceid=KR:ko"
-    lines.append(f'🌐 구글 뉴스 (<a href="{html.escape(more, quote=True)}">전체 보기</a>)')
-    if gnews:
-        lines += [a_tag(n) for n in gnews]
-    else:
-        lines.append("• (최근 기사 없음)")
-    if news:
-        lines.append("📰 네이버 뉴스")
-        lines += [a_tag(n) for n in news]
-    if notices:
-        lines.append("📑 공시")
-        lines += [a_tag(n) for n in notices]
+    lines.append(
+        f'🔗 <a href="https://finance.naver.com/item/main.naver?code={code}">종목페이지</a>'
+        f' · 🌐 <a href="{html.escape(more, quote=True)}">구글뉴스 전체</a>'
+    )
+    items = (
+        [a_tag(x, "•", tlen) for x in d["gnews"][:g]]
+        + [a_tag(x, "📰", tlen) for x in d["news"][:n]]
+        + [a_tag(x, "📑", tlen) for x in d["notices"][:ds]]
+    )
+    lines += items or ["• (최근 기사 없음)"]
     return "\n".join(lines)
+
+
+# 한 메시지(4000자)에 안 들어가면 위에서부터 차례로 줄여서 재시도: (구글뉴스, 네이버뉴스, 공시, 제목길이)
+LADDER = [
+    (5, 2, 2, 45), (4, 2, 1, 42), (3, 1, 1, 38), (3, 1, 0, 35),
+    (2, 1, 0, 32), (2, 0, 0, 30), (1, 0, 0, 28),
+]
+
+
+def build_two_messages(targets: list[dict], data: dict, header: str) -> list[str]:
+    half = (len(targets) + 1) // 2
+    groups = [(1, targets[:half])]
+    if targets[half:]:
+        groups.append((half + 1, targets[half:]))
+    total = len(groups)
+
+    msgs = []
+    for ci, cfg in enumerate(LADDER):
+        last = ci == len(LADDER) - 1
+        msgs, ok = [], True
+        for gi, (start, grp) in enumerate(groups):
+            if gi == 0:
+                head = header.replace("{part}", f" ({gi + 1}/{total})" if total > 1 else "")
+            else:
+                head = f"🗞️ <b>종목 재료 리포트 ({gi + 1}/{total})</b>"
+            blocks = [format_stock(start + i, x, data[x["code"]], *cfg) for i, x in enumerate(grp)]
+            msg = head + "\n\n" + "\n\n".join(blocks)
+            if visible_len(msg) > 4000:
+                if not last:
+                    ok = False
+                    break
+                while visible_len(msg) > 4000 and len(blocks) > 1:  # 최후 수단: 뒤쪽 종목 삭제
+                    blocks.pop()
+                    msg = head + "\n\n" + "\n\n".join(blocks)
+            msgs.append(msg)
+        if ok:
+            print(f"[안내] 압축 단계 {ci + 1}/{len(LADDER)} 적용 {cfg}")
+            return msgs
+    return msgs
 
 
 # ------------------------------------------------------------------ 실행 모드
@@ -631,22 +669,16 @@ def run_news():
         note = "저장된 순위가 없어 현재 순위 기준"
     targets = targets[:NEWS_MAX_STOCKS]
 
-    kst = datetime.utcnow() + timedelta(hours=9)
-    header = f"🗞️ <b>종목 재료 리포트</b>\n🕗 {kst:%Y-%m-%d %H:%M} KST · {note}"
-
-    chunks, cur = [], header
-    for i, s in enumerate(targets, 1):
-        block = build_stock_block(i, s)
-        if len(cur) + len(block) + 2 > 3800:
-            chunks.append(cur)
-            cur = block
-        else:
-            cur += "\n\n" + block
+    data = {}
+    for s in targets:
+        data[s["code"]] = collect_stock_data(s)
         time.sleep(0.3)
-    chunks.append(cur)
-    for c in chunks:
-        send_telegram(c, use_html=True)
-        time.sleep(1.2)  # 텔레그램 연속 전송 제한 회피
+
+    kst = datetime.utcnow() + timedelta(hours=9)
+    header = f"🗞️ <b>종목 재료 리포트{{part}}</b>\n🕗 {kst:%Y-%m-%d %H:%M} KST · {note}"
+    for m in build_two_messages(targets, data, header):
+        send_telegram(m, use_html=True)
+        time.sleep(1.2)
 
 
 def run_rank():
