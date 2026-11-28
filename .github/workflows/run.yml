@@ -1,30 +1,31 @@
 name: 한국장 랭킹 순위
 
 on:
-  schedule:
-    # 한국시간(KST, UTC+9) 매일 08:00 ~ 21:00 매시 정각 실행 (총 14회)
-    # KST 08:00 = UTC 23:00 (전날)
-    # KST 09:00 ~ 21:00 = UTC 00:00 ~ 12:00
-    - cron: "0 23,0-12 * * *"
+  # GitHub 자체 schedule은 제거했습니다. cron-job.org와 중복 실행되기 때문입니다.
   repository_dispatch:
-    types: [run-cron] # cron-job.org API 호출용
-  workflow_dispatch: # Actions 탭에서 수동 테스트 실행 가능
+    types: [run-cron]
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "auto / rank / news"
+        default: "auto"
+
+permissions:
+  contents: write   # last_rank.json 커밋용
 
 concurrency:
   group: korea-stock-rank-top20
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   send-ranking:
     runs-on: ubuntu-latest
-    timeout-minutes: 3
+    timeout-minutes: 5
 
     steps:
-      - name: 코드 체크아웃
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Python 환경 설정
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
@@ -33,8 +34,16 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests beautifulsoup4
 
-      - name: 한국장 랭킹 순위 발송 실행
+      - name: 실행
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          RUN_MODE: ${{ github.event.inputs.mode || 'auto' }}
         run: python main.py
+
+      - name: 순위 종목 저장 (홀수 시 실행분)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add last_rank.json || true
+          git diff --cached --quiet || (git commit -m "update last_rank" && git push)
