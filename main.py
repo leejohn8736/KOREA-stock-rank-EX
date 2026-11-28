@@ -600,9 +600,10 @@ def format_stock(rank: int, s: dict, d: dict, g: int, m: int, tlen: int) -> str:
 
 
 # 한 메시지에 안 들어가면 위에서부터 차례로 줄여서 재시도: (뉴스 수, 재료 수, 제목 길이)
-LADDER = [(3, 3, 44), (3, 2, 42), (2, 2, 40), (2, 1, 38), (1, 1, 36), (1, 0, 34), (1, 0, 28)]
+LADDER = [(5, 4, 48), (4, 3, 44), (3, 3, 44), (3, 2, 42), (2, 2, 40), (2, 1, 38), (1, 1, 34), (1, 0, 28)]
 MAX_CHARS = 4000
 MAX_ENTITIES = 90
+NEWS_MESSAGES = int(os.environ.get("NEWS_MESSAGES", "5"))  # 재료 리포트를 나눠 보낼 메시지 수
 
 
 def split_groups(targets: list[dict], k: int) -> list[tuple]:
@@ -617,35 +618,32 @@ def split_groups(targets: list[dict], k: int) -> list[tuple]:
 
 
 def build_messages(targets: list[dict], data: dict, note: str) -> list[str]:
-    """먼저 2개 메시지로 시도하고, 너무 줄여야 하면 3개로 나눔."""
+    """종목을 NEWS_MESSAGES개 메시지로 균등 분할. 길면 기사 수를 줄일 뿐 종목은 빼지 않음."""
     kst = datetime.utcnow() + timedelta(hours=9)
     stamp = f"🕗 {kst:%Y-%m-%d %H:%M} KST · {note}"
+    groups = split_groups(targets, NEWS_MESSAGES)
+    total = len(groups)
+
+    def too_big(t: str) -> bool:
+        return visible_len(t) > MAX_CHARS or count_entities(t) > MAX_ENTITIES
+
     msgs = []
-    for k, ladder in ((2, LADDER[:4]), (3, LADDER)):
-        groups = split_groups(targets, k)
-        total = len(groups)
-        for ci, cfg in enumerate(ladder):
-            last = k == 3 and ci == len(ladder) - 1
-            msgs, ok = [], True
-            for gi, (start, grp) in enumerate(groups):
-                part = f" ({gi + 1}/{total})" if total > 1 else ""
-                head = f"🗞️✨ <b>종목 재료 리포트{part}</b> ✨🗞️"
-                if gi == 0:
-                    head += "\n" + stamp
-                blocks = [format_stock(start + i, x, data[x["code"]], *cfg) for i, x in enumerate(grp)]
-                msg = head + "\n\n" + "\n\n".join(blocks)
-                too_big = lambda t: visible_len(t) > MAX_CHARS or count_entities(t) > MAX_ENTITIES
-                if too_big(msg):
-                    if not last:
-                        ok = False
-                        break
-                    while too_big(msg) and len(blocks) > 1:  # 최후 수단: 뒤쪽 종목 삭제
-                        blocks.pop()
-                        msg = head + "\n\n" + "\n\n".join(blocks)
-                msgs.append(msg)
-            if ok:
-                print(f"[안내] {total}개 메시지 / 압축 단계 {ci + 1} 적용 {cfg}")
-                return msgs
+    for ci, cfg in enumerate(LADDER):
+        msgs, ok = [], True
+        for gi, (start, grp) in enumerate(groups):
+            part = f" ({gi + 1}/{total})" if total > 1 else ""
+            head = f"🗞️✨ <b>종목 재료 리포트{part}</b> ✨🗞️"
+            if gi == 0:
+                head += "\n" + stamp
+            blocks = [format_stock(start + i, x, data[x["code"]], *cfg) for i, x in enumerate(grp)]
+            msg = head + "\n\n" + "\n\n".join(blocks)
+            msgs.append(msg)
+            if too_big(msg):
+                ok = False
+        if ok:
+            print(f"[안내] {total}개 메시지 / 압축 단계 {ci + 1}/{len(LADDER)} 적용 {cfg}")
+            return msgs
+    print("[안내] 최소 단계로도 길어 그대로 전송 시도")
     return msgs
 
 
